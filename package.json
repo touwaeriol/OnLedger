@@ -15,7 +15,7 @@
     "dist:win": "npm run build:renderer && electron-builder --win",
     "dist:mac": "npm run build:renderer && electron-builder --mac",
     "test:providers": "node scripts/smoke-test.js",
-    "dev:web": "concurrently -k -n api,vite \"cross-env PORT=8787 node server/server.js\" \"vite\"",
+    "dev:web": "concurrently -k -n api,vite \"cross-env PORT=8787 ALLOWED_ORIGINS=http://localhost:5173 node server/server.js\" \"vite\"",
     "server": "node server/server.js"
   },
   "dependencies": {},

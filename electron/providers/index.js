@@ -1,4 +1,5 @@
 const { getChain } = require('../chains');
+const { isValidAddress } = require('./address');
 
 const PROVIDERS = {
   evm: require('./evm'),
@@ -27,7 +28,7 @@ function resolveToken(chain, tokenReq) {
     const contract = str(tokenReq.contract, 100);
     if (!contract) throw new InputError('合约地址格式不正确');
     if (chain.type === 'btc') throw new InputError('Bitcoin 不支持代币合约');
-    if (!new RegExp(chain.addressPattern).test(contract)) throw new InputError('合约地址格式不正确');
+    if (!new RegExp(chain.addressPattern).test(contract) || !isValidAddress(chain.type, contract)) throw new InputError('合约地址格式不正确');
     const known = chain.tokens.find((t) => t.contract && t.contract.toLowerCase() === contract.toLowerCase());
     if (known) return known;
     return { symbol: 'TOKEN', contract, decimals: undefined };
@@ -52,7 +53,7 @@ function normalizeRequest(req) {
     throw new InputError('不支持的链');
   }
   const address = str(req.address, 100);
-  if (!address || !new RegExp(chain.addressPattern).test(address)) {
+  if (!address || !new RegExp(chain.addressPattern).test(address) || !isValidAddress(chain.type, address)) {
     throw new InputError(`${chain.name} 地址格式不正确`);
   }
   const token = resolveToken(chain, req.token);

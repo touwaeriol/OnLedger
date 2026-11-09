@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from 'react';
-import { Table, Tag, Typography, Tooltip, Segmented, Input, Flex } from 'antd';
+import React from 'react';
+import { Table, Tag, Typography, Tooltip, Flex } from 'antd';
 import { ExportOutlined } from '@ant-design/icons';
 import dayjs from 'dayjs';
 import { formatUnits, prettyAmount } from '../utils';
@@ -34,23 +34,7 @@ const cmpBig = (a, b) => {
   return x === y ? 0 : x > y ? 1 : -1;
 };
 
-export default function LedgerTable({ records, loading, footer }) {
-  const [dir, setDir] = useState('all');
-  const [keyword, setKeyword] = useState('');
-
-  const data = useMemo(() => {
-    const k = keyword.trim().toLowerCase();
-    return records
-      .filter((r) => dir === 'all' || r.direction === dir)
-      .filter(
-        (r) =>
-          !k ||
-          r.hash.toLowerCase().includes(k) ||
-          (r.from || '').toLowerCase().includes(k) ||
-          (r.to || '').toLowerCase().includes(k)
-      );
-  }, [records, dir, keyword]);
-
+export default function LedgerTable({ records, loading, footer, emptyText }) {
   const columns = [
     {
       title: '对方地址',
@@ -124,38 +108,16 @@ export default function LedgerTable({ records, loading, footer }) {
   ];
 
   return (
-    <Flex vertical gap={12}>
-      <Flex gap={12} wrap align="center">
-        <Segmented
-          value={dir}
-          onChange={setDir}
-          options={[
-            { label: '全部', value: 'all' },
-            { label: '转入', value: 'in' },
-            { label: '转出', value: 'out' },
-          ]}
-        />
-        <Input.Search
-          allowClear
-          placeholder="按交易哈希 / 地址筛选"
-          style={{ width: 320 }}
-          onSearch={setKeyword}
-          onChange={(e) => !e.target.value && setKeyword('')}
-        />
-        <Text type="secondary">
-          显示 {data.length} / 已加载 {records.length} 条
-        </Text>
-      </Flex>
-      <Table
-        rowKey="_key"
-        size="middle"
-        columns={columns}
-        dataSource={data}
-        loading={loading}
-        scroll={{ x: 'max-content' }}
-        pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
-        footer={footer}
-      />
-    </Flex>
+    <Table
+      rowKey="_key"
+      size="middle"
+      columns={columns}
+      dataSource={records}
+      loading={loading}
+      scroll={{ x: 'max-content' }}
+      pagination={{ defaultPageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100], showTotal: (t) => `共 ${t} 条` }}
+      footer={footer}
+      locale={emptyText ? { emptyText } : undefined}
+    />
   );
 }

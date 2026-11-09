@@ -10,7 +10,7 @@ const net = require('node:net');
 
 const { CHAINS } = require('../electron/chains');
 const { queryLedger, normalizeRequest, InputError } = require('../electron/providers');
-const { BusyError } = require('../electron/providers/util');
+const { BusyError, QuotaError, runWithSignal } = require('../electron/providers/util');
 
 // ---------------------------------------------------------------------------
 // 配置
@@ -47,11 +47,14 @@ const MAX_URL_LENGTH = 2048;
 const MAX_BODY_BYTES = 4 * 1024;
 const BODY_TIMEOUT_MS = 10_000;
 const MAX_INFLIGHT_LEDGER = intEnv('MAX_INFLIGHT', 32, 1, 1024);
+// 每个客户端（IPv4 / IPv6 /64）同时进行的查询数；同一 IPv6 /48 为其 3 倍
+const MAX_INFLIGHT_PER_CLIENT = intEnv('LEDGER_MAX_INFLIGHT_PER_IP', 3, 1, 1024);
 const CACHE_TTL_MS = 30_000;
+const NEG_CACHE_TTL_MS = 60_000; // 上游明确拒绝（非临时性错误）的结果缓存时间，避免重复消耗 API 配额
 const CACHE_MAX_ENTRIES = 500;
 const CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const CACHE_MAX_ENTRY_BYTES = 1024 * 1024;
-const BUCKETS_MAX = 50_000;
+const BUCKETS_MAX = intEnv('RATE_BUCKETS_MAX', 50_000, 16, 1_000_000);
 const SHUTDOWN_GRACE_MS = 8_000;
 
 // ---------------------------------------------------------------------------
@@ -75,7 +78,7 @@ const SECURITY_HEADERS = [
   ],
   ['Cross-Origin-Opener-Policy', 'same-origin'],
   ['Cross-Origin-Resource-Policy', 'same-origin'],
-  ['Strict-Transport-Security', 'max-age=31536000'],
+  ['Strict-Transport-Security', 'max-age=31536000; includeSubDomains'],
   ['X-DNS-Prefetch-Control', 'off'],
   ['Origin-Agent-Cluster', '?1'],
 ];
@@ -149,9 +152,8 @@ function clientIp(req) {
   return normalizeIp(req.socket.remoteAddress) || 'unknown';
 }
 
-// IPv6 按 /64 聚合限流（单个用户通常拥有整个 /64）
-function rateKey(ip) {
-  if (!net.isIPv6(ip)) return ip;
+// IPv6 地址展开为 8 组十六进制（去掉前导零）
+function ipv6Groups(ip) {
   let a = ip.split('%')[0].toLowerCase();
   if (a.includes('.')) {
     const i = a.lastIndexOf(':');
@@ -165,7 +167,15 @@ function rateKey(ip) {
     const tp = tail ? tail.split(':') : [];
     parts = [...hp, ...new Array(Math.max(0, 8 - hp.length - tp.length)).fill('0'), ...tp];
   }
-  return parts.slice(0, 4).map((p) => parseInt(p || '0', 16).toString(16)).join(':') + '::/64';
+  return parts.map((p) => parseInt(p || '0', 16).toString(16));
+}
+
+// 限流键：IPv4 按单个地址；IPv6 按 /64 聚合（单个用户通常拥有整个 /64），
+// 另按 /48 再做一层更宽松但共享的限制（防止用大段地址轮换绕过 /64 限流）
+function clientKeys(ip) {
+  if (!net.isIPv6(ip)) return { key: ip, wide: null };
+  const g = ipv6Groups(ip);
+  return { key: g.slice(0, 4).join(':') + '::/64', wide: g.slice(0, 3).join(':') + '::/48' };
 }
 
 function lastHeaderValue(v) {
@@ -212,62 +222,123 @@ function isSameOrigin(req) {
 // ---------------------------------------------------------------------------
 // 令牌桶限流（内存）
 // ---------------------------------------------------------------------------
+const FULL_RETRY_AFTER = 10; // 桶数量已满时拒绝新客户端，建议的等待秒数
+
 class RateLimiter {
   constructor({ perMinute, burst, maxKeys }) {
     this.rate = perMinute / 60_000; // 每毫秒补充的令牌数
     this.burst = burst;
     this.maxKeys = maxKeys;
     this.buckets = new Map();
+    this.lastPressureSweep = 0;
   }
 
-  // 返回 0 表示放行，否则返回需等待的秒数
-  take(key) {
-    const now = Date.now();
+  // 只检查不扣减：返回 0 表示可放行，否则返回需等待的秒数
+  check(key, now) {
+    const b = this.buckets.get(key);
+    if (!b) {
+      if (this.buckets.size < this.maxKeys) return 0;
+      // 容量已满：先清理已补满（空闲）的桶；仍满则拒绝新键，而不是淘汰活跃客户端的状态
+      if (now - this.lastPressureSweep >= 1000) {
+        this.lastPressureSweep = now;
+        this.sweep(now);
+      }
+      return this.buckets.size < this.maxKeys ? 0 : FULL_RETRY_AFTER;
+    }
+    const tokens = Math.min(this.burst, b.tokens + (now - b.ts) * this.rate);
+    if (tokens >= 1) return 0;
+    return Math.max(1, Math.ceil((1 - tokens) / this.rate / 1000));
+  }
+
+  // 扣减一个令牌（调用前须 check 通过）
+  consume(key, now) {
     let b = this.buckets.get(key);
     if (b) {
       b.tokens = Math.min(this.burst, b.tokens + (now - b.ts) * this.rate);
       b.ts = now;
-      this.buckets.delete(key); // 重新插入，保持近似 LRU 顺序
     } else {
-      b = { tokens: this.burst, ts: now };
-      while (this.buckets.size >= this.maxKeys) {
-        this.buckets.delete(this.buckets.keys().next().value); // 容量上限：淘汰最久未访问的
-      }
+      this.buckets.set(key, (b = { tokens: this.burst, ts: now }));
     }
-    this.buckets.set(key, b);
-    if (b.tokens >= 1) {
-      b.tokens -= 1;
-      return 0;
-    }
-    return Math.max(1, Math.ceil((1 - b.tokens) / this.rate / 1000));
+    b.tokens -= 1;
   }
 
   // 已完全补满的桶等同于新桶，可以删除
-  sweep() {
-    const now = Date.now();
+  sweep(now = Date.now()) {
     const fullAfter = this.burst / this.rate;
     for (const [k, b] of this.buckets) if (now - b.ts >= fullAfter) this.buckets.delete(k);
   }
 }
 
-const ledgerLimiter = new RateLimiter({
+// 客户端限流：/64（或 IPv4 地址）与 /48 两层同时生效，任一层不足则都不扣减
+class ClientLimiter {
+  constructor({ perMinute, burst }) {
+    this.narrow = new RateLimiter({ perMinute, burst, maxKeys: BUCKETS_MAX });
+    this.wide = new RateLimiter({ perMinute: perMinute * 3, burst: burst * 3, maxKeys: BUCKETS_MAX });
+  }
+
+  // 返回 0 表示放行，否则返回需等待的秒数
+  take(ck) {
+    const now = Date.now();
+    const w = Math.max(ck.wide ? this.wide.check(ck.wide, now) : 0, this.narrow.check(ck.key, now));
+    if (w) return w;
+    if (ck.wide) this.wide.consume(ck.wide, now);
+    this.narrow.consume(ck.key, now);
+    return 0;
+  }
+
+  sweep() {
+    this.narrow.sweep();
+    this.wide.sweep();
+  }
+}
+
+const ledgerLimiter = new ClientLimiter({
   perMinute: intEnv('LEDGER_RATE_PER_MIN', 60, 1, 100_000),
   burst: intEnv('LEDGER_RATE_BURST', 20, 1, 100_000),
-  maxKeys: BUCKETS_MAX,
 });
-const generalLimiter = new RateLimiter({
+const generalLimiter = new ClientLimiter({
   perMinute: intEnv('GENERAL_RATE_PER_MIN', 300, 1, 100_000),
   burst: intEnv('GENERAL_RATE_BURST', 100, 1, 100_000),
-  maxKeys: BUCKETS_MAX,
 });
 
+// 每个客户端同时进行的账单查询数（含读取请求体与等待上游的时间）
+const clientInflight = new Map(); // 限流键 -> 进行中的数量
+
+function acquireClientSlot(ck) {
+  const slots = [[ck.key, MAX_INFLIGHT_PER_CLIENT]];
+  if (ck.wide) slots.push([ck.wide, MAX_INFLIGHT_PER_CLIENT * 3]);
+  for (const [k, max] of slots) if ((clientInflight.get(k) || 0) >= max) return null;
+  for (const [k] of slots) clientInflight.set(k, (clientInflight.get(k) || 0) + 1);
+  let held = true;
+  return () => {
+    if (!held) return;
+    held = false;
+    for (const [k] of slots) {
+      const n = (clientInflight.get(k) || 1) - 1;
+      if (n > 0) clientInflight.set(k, n);
+      else clientInflight.delete(k);
+    }
+  };
+}
+
 // ---------------------------------------------------------------------------
-// 账单查询：缓存 + 并发合并 + 全局并发上限
+// 账单查询：缓存（含错误结果的短期缓存）+ 并发合并 + 全局并发上限 + 客户端断开时取消上游
 // ---------------------------------------------------------------------------
-const cache = new Map(); // key -> { body, exp, size }
+// 结果统一表示为 { status, body, headers? }，body 为已序列化的 JSON 字符串
+const cache = new Map(); // key -> { result, exp, size }
 let cacheBytes = 0;
-const inflight = new Map(); // key -> Promise<body>
+const inflight = new Map(); // key -> { promise, controller, waiters, settled }
 let activeUpstream = 0;
+
+// EVM 链依赖 Etherscan API Key，未配置时不开放
+const chainAvailable = (chain) => chain.type !== 'evm' || !!SETTINGS.etherscanApiKey;
+
+// 上游错误信息对外展示前的处理：脱敏 API Key，去掉桌面端「设置」相关提示
+const SETTINGS_HINT_RE = /[（(][^（()）]*「设置」[^（()）]*[）)]/g;
+const publicMessage = (msg) => scrub(msg).replace(SETTINGS_HINT_RE, '').trim().slice(0, 200);
+
+// 上游限流类错误属于临时状态，不做错误缓存
+const RATE_LIMITED_RE = /rate limit|too many|频繁|繁忙/i;
 
 function cacheKey({ chain, token, address, cursor }) {
   // 仅 EVM（十六进制）大小写不敏感；TRON/BTC 的 base58 地址区分大小写，不能统一小写，否则会造成缓存投毒
@@ -291,14 +362,14 @@ function cacheGet(key) {
     cacheDelete(key);
     return null;
   }
-  return e.body;
+  return e.result;
 }
 
-function cacheSet(key, body) {
-  const size = Buffer.byteLength(body);
+function cacheSet(key, result, ttl) {
+  const size = Buffer.byteLength(result.body);
   if (size > CACHE_MAX_ENTRY_BYTES) return;
   cacheDelete(key);
-  cache.set(key, { body, size, exp: Date.now() + CACHE_TTL_MS });
+  cache.set(key, { result, size, exp: Date.now() + ttl });
   cacheBytes += size;
   while (cache.size > CACHE_MAX_ENTRIES || cacheBytes > CACHE_MAX_BYTES) {
     cacheDelete(cache.keys().next().value);
@@ -310,36 +381,91 @@ function cacheSweep() {
   for (const [k, e] of cache) if (e.exp <= now) cacheDelete(k);
 }
 
-async function getLedger(raw) {
-  const norm = normalizeRequest(raw); // 非法输入在这里抛 InputError
-  const key = cacheKey(norm);
-  const hit = cacheGet(key);
-  if (hit) return { body: hit, cache: 'HIT' };
-  if (norm.chain.type === 'evm' && !SETTINGS.etherscanApiKey) {
-    throw new HttpError(503, '本站未配置 Etherscan API Key，暂不支持 EVM 链查询');
-  }
+const errorResult = (status, error, headers) => ({ status, body: JSON.stringify({ ok: false, error }), headers });
 
-  let p = inflight.get(key);
-  if (p) return { body: await p, cache: 'SHARED' }; // 相同查询正在进行，共享同一次上游调用
-  if (activeUpstream >= MAX_INFLIGHT_LEDGER) {
-    throw new HttpError(503, '服务繁忙，请稍后再试', { 'Retry-After': '5' });
+// 上游失败 -> 响应结果；cacheable 表示可以短期缓存（上游明确拒绝），临时性错误不缓存
+function failureResult(e, aborted) {
+  if (e instanceof QuotaError) {
+    return { result: errorResult(503, e.message, { 'Retry-After': String(e.retryAfter) }), cacheable: false };
   }
+  if (e instanceof BusyError) {
+    return { result: errorResult(503, '服务繁忙，请稍后再试', { 'Retry-After': '5' }), cacheable: false };
+  }
+  if (e instanceof InputError) {
+    return { result: errorResult(400, publicMessage(e.message) || '请求参数不正确'), cacheable: !aborted };
+  }
+  const msg = (e instanceof Error && publicMessage(e.message)) || '上游服务错误，请稍后再试';
+  if (!aborted) log(`upstream-error ${clean(msg, 200)}`);
+  const transient = !!(e && (e.transient || e.aborted));
+  return { result: errorResult(502, msg), cacheable: !aborted && !transient && !RATE_LIMITED_RE.test(msg) };
+}
+
+function startJob(key, raw) {
+  const controller = new AbortController();
+  const job = { controller, waiters: 0, settled: false, promise: null };
   activeUpstream++;
   // 先异步化再调用，保证 finally 一定在 inflight.set 之后执行
-  p = Promise.resolve()
-    .then(() => queryLedger(raw, SETTINGS))
-    .then((data) => {
-      const body = JSON.stringify({ ok: true, data });
-      // 余额查询失败属于部分错误，不缓存，避免把临时错误扩散给后续请求
-      if (!data.balanceError) cacheSet(key, body);
-      return body;
-    })
+  job.promise = Promise.resolve()
+    .then(() => runWithSignal(controller.signal, () => queryLedger(raw, SETTINGS)))
+    .then(
+      (data) => {
+        if (data && data.balanceError != null) {
+          data.balanceError = publicMessage(String(data.balanceError)) || '余额查询失败';
+        }
+        const result = { status: 200, body: JSON.stringify({ ok: true, data }) };
+        // 余额查询失败属于部分错误，不缓存，避免把临时错误扩散给后续请求
+        if (!data.balanceError && !controller.signal.aborted) cacheSet(key, result, CACHE_TTL_MS);
+        return result;
+      },
+      (e) => {
+        const aborted = controller.signal.aborted;
+        const { result, cacheable } = failureResult(e, aborted);
+        if (cacheable) cacheSet(key, result, NEG_CACHE_TTL_MS);
+        return result;
+      }
+    )
     .finally(() => {
+      job.settled = true;
       activeUpstream--;
-      inflight.delete(key);
+      if (inflight.get(key) === job) inflight.delete(key);
     });
-  inflight.set(key, p);
-  return { body: await p, cache: 'MISS' };
+  inflight.set(key, job);
+  return job;
+}
+
+// client: { gone: boolean, onGone: function|null }，由调用方在客户端断开时触发 onGone
+async function getLedger(raw, client) {
+  const norm = normalizeRequest(raw); // 非法输入在这里抛 InputError
+  if (!chainAvailable(norm.chain)) throw new HttpError(400, '该链暂未开放');
+  const key = cacheKey(norm);
+  const hit = cacheGet(key);
+  if (hit) return hit;
+
+  let job = inflight.get(key); // 相同查询正在进行，共享同一次上游调用
+  if (!job) {
+    if (activeUpstream >= MAX_INFLIGHT_LEDGER) {
+      throw new HttpError(503, '服务繁忙，请稍后再试', { 'Retry-After': '5' });
+    }
+    job = startJob(key, raw);
+  }
+  // 引用计数：所有等待者都已断开时才取消上游请求
+  job.waiters++;
+  let left = false;
+  const leave = () => {
+    if (left) return;
+    left = true;
+    if (--job.waiters === 0 && !job.settled) {
+      job.controller.abort();
+      if (inflight.get(key) === job) inflight.delete(key); // 已取消的任务不再供新请求共享
+    }
+  };
+  client.onGone = leave;
+  try {
+    return await job.promise;
+  } finally {
+    client.onGone = null;
+    leave();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -394,31 +520,60 @@ function closeAfterResponse(req, res) {
 // ---------------------------------------------------------------------------
 // API 路由
 // ---------------------------------------------------------------------------
-const CHAINS_BODY = JSON.stringify({ ok: true, data: CHAINS });
+// 每条链附带 available：EVM 链在未配置 Etherscan API Key 时不可用（不返回其他服务端配置）
+const CHAINS_BODY = JSON.stringify({ ok: true, data: CHAINS.map((c) => ({ ...c, available: chainAvailable(c) })) });
 
-async function handleLedger(req, res, ip) {
+// 行情价格模块按需加载（不存在或加载失败时接口返回 503，不影响其他功能）
+let pricesModule = null;
+function loadPrices() {
+  if (!pricesModule) pricesModule = require('../electron/providers/prices');
+  return pricesModule;
+}
+
+// 跨站 / 类型错误等廉价拒绝同样计入通用限流，避免被用来刷日志
+function rejectCheap(req, res, ck, status, msg) {
+  closeAfterResponse(req, res);
+  const wait = generalLimiter.take(ck);
+  if (wait) return sendError(res, 429, '请求过于频繁，请稍后再试', { 'Retry-After': String(wait) });
+  return sendError(res, status, msg);
+}
+
+async function handleLedger(req, res, ck) {
+  // 非 POST 请求已在 handle() 中计入通用限流
   if (req.method !== 'POST') {
     closeAfterResponse(req, res);
     return sendError(res, 405, '不支持的请求方法', { Allow: 'POST' });
   }
-  const wait = ledgerLimiter.take(rateKey(ip));
-  if (wait) {
-    closeAfterResponse(req, res);
-    return sendError(res, 429, '请求过于频繁，请稍后再试', { 'Retry-After': String(wait) });
-  }
-  if (!isSameOrigin(req)) {
-    closeAfterResponse(req, res);
-    return sendError(res, 403, '禁止跨站请求');
-  }
+  // 先做廉价校验，再扣减账单查询限额（避免恶意网站借受害者浏览器耗尽其限额）
+  if (!isSameOrigin(req)) return rejectCheap(req, res, ck, 403, '禁止跨站请求');
   const ct = String(req.headers['content-type'] || '').split(';');
   const mediaType = ct[0].trim().toLowerCase();
   const params = ct.slice(1).map((p) => p.trim().toLowerCase()).filter(Boolean);
   const badCharset = params.some((p) => p.startsWith('charset=') && !/^charset="?utf-8"?$/.test(p));
   const enc = String(req.headers['content-encoding'] || 'identity').trim().toLowerCase();
   if (mediaType !== 'application/json' || badCharset || enc !== 'identity') {
-    closeAfterResponse(req, res);
-    return sendError(res, 415, '请求类型必须为 application/json');
+    return rejectCheap(req, res, ck, 415, '请求类型必须为 application/json');
   }
+
+  const wait = ledgerLimiter.take(ck);
+  if (wait) {
+    closeAfterResponse(req, res);
+    return sendError(res, 429, '请求过于频繁，请稍后再试', { 'Retry-After': String(wait) });
+  }
+  const releaseSlot = acquireClientSlot(ck);
+  if (!releaseSlot) {
+    closeAfterResponse(req, res);
+    return sendError(res, 429, '同时进行的查询过多，请等待之前的查询完成', { 'Retry-After': '2' });
+  }
+  // 响应结束或连接断开时释放名额；未完成响应就断开视为客户端离开，通知取消上游请求
+  const client = { gone: false, onGone: null };
+  res.once('close', () => {
+    releaseSlot();
+    if (!res.writableEnded) {
+      client.gone = true;
+      if (client.onGone) client.onGone();
+    }
+  });
 
   let raw;
   try {
@@ -434,6 +589,7 @@ async function handleLedger(req, res, ip) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     return sendError(res, 400, '请求参数不正确');
   }
+  if (client.gone) return;
 
   // 只挑出需要的字段，丢弃其余内容
   const tok = raw.token;
@@ -449,24 +605,35 @@ async function handleLedger(req, res, ip) {
     cursor: raw.cursor,
   };
 
+  let r;
   try {
-    const { body, cache: cacheStatus } = await getLedger(picked);
-    res.setHeader('X-Cache', cacheStatus);
-    return sendJson(res, 200, body);
+    r = await getLedger(picked, client);
   } catch (e) {
-    if (e instanceof InputError) return sendError(res, 400, scrub(e.message).slice(0, 200) || '请求参数不正确');
+    if (e instanceof InputError) return sendError(res, 400, publicMessage(e.message) || '请求参数不正确');
     if (e instanceof HttpError) return sendError(res, e.status, e.message, e.headers);
-    if (e instanceof BusyError) return sendError(res, 503, '服务繁忙，请稍后再试', { 'Retry-After': '5' });
-    // 网页版没有「设置」界面，去掉桌面端的相关提示
-    const m = e instanceof Error ? scrub(e.message).replace(/[（(][^（()）]*「设置」[^（()）]*[）)]/g, '').trim() : '';
-    const msg = m.slice(0, 200) || '上游服务错误，请稍后再试';
-    log(`upstream-error ${clean(msg, 200)}`);
-    return sendError(res, 502, msg);
+    throw e;
   }
+  return sendJson(res, r.status, r.body, r.headers);
 }
 
-function handleApi(req, res, pathname, ip) {
-  if (pathname === '/api/ledger') return handleLedger(req, res, ip);
+async function handlePrices(req, res) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    closeAfterResponse(req, res);
+    return sendError(res, 405, '不支持的请求方法', { Allow: 'GET, HEAD' });
+  }
+  let data;
+  try {
+    data = await loadPrices().getPrices();
+  } catch (e) {
+    log(`prices-error ${clean(scrub(e && e.message ? e.message : String(e)), 200)}`);
+    return sendError(res, 503, '行情暂不可用');
+  }
+  sendJson(res, 200, { ok: true, data }, { 'Cache-Control': 'public, max-age=60' });
+}
+
+function handleApi(req, res, pathname, ck) {
+  if (pathname === '/api/ledger') return handleLedger(req, res, ck);
+  if (pathname === '/api/prices') return handlePrices(req, res);
   if (pathname === '/api/chains') {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       closeAfterResponse(req, res);
@@ -600,10 +767,8 @@ function handleStatic(req, res, rawPath) {
     const cc = p.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache';
     return serveEntry(req, res, entry, cc);
   }
-  // 看起来像文件（有扩展名）或位于 /assets 下的缺失资源 -> 404；其余路径交给前端（SPA）
-  const last = p.slice(p.lastIndexOf('/') + 1);
-  if (p.startsWith('/assets/') || last.includes('.') || !index) return sendText(res, 404, 'Not Found');
-  return serveEntry(req, res, index, 'no-cache');
+  // 前端没有路由且使用相对资源路径，其他未知路径一律 404（不回退到 index.html）
+  return sendText(res, 404, 'Not Found');
 }
 
 // ---------------------------------------------------------------------------
@@ -646,9 +811,11 @@ async function handle(req, res) {
     return sendText(res, 200, 'ok');
   }
 
+  const ck = clientKeys(ip);
   const isApi = rawPath === '/api' || rawPath.startsWith('/api/');
-  if (!(isApi && rawPath === '/api/ledger')) {
-    const wait = generalLimiter.take(rateKey(ip));
+  // 只有 POST /api/ledger 使用单独的账单限流，其余（包括对该路径的其他方法）都计入通用限流
+  if (!(rawPath === '/api/ledger' && req.method === 'POST')) {
+    const wait = generalLimiter.take(ck);
     if (wait) {
       closeAfterResponse(req, res);
       const h = { 'Retry-After': String(wait) };
@@ -656,15 +823,16 @@ async function handle(req, res) {
     }
   }
 
-  if (isApi) return handleApi(req, res, rawPath, ip);
+  if (isApi) return handleApi(req, res, rawPath, ck);
   return handleStatic(req, res, rawPath);
 }
 
 const server = http.createServer(
   {
-    requestTimeout: 30_000, // 接收完整请求的最长时间
-    headersTimeout: 20_000,
-    keepAliveTimeout: 65_000,
+    // Caddy 的空闲 keep-alive 最长约 2 分钟：本端必须更晚关闭空闲连接，避免代理复用已被关闭的连接
+    keepAliveTimeout: 130_000,
+    headersTimeout: 131_000, // 须大于 keepAliveTimeout
+    requestTimeout: 135_000, // 须不小于 headersTimeout；请求体另有 BODY_TIMEOUT_MS 限制
     maxHeaderSize: 16 * 1024,
     requireHostHeader: true,
     joinDuplicateHeaders: false,
@@ -679,7 +847,7 @@ const server = http.createServer(
 );
 server.maxHeadersCount = 64;
 server.maxRequestsPerSocket = 1000;
-server.timeout = 120_000; // 套接字空闲超时（上游最慢情况下也够用）
+server.timeout = 140_000; // 套接字空闲超时（须大于 keepAliveTimeout；上游最慢情况下也够用）
 server.maxConnections = intEnv('MAX_CONNECTIONS', 2048, 16, 100_000);
 
 server.on('clientError', (err, socket) => {

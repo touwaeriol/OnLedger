@@ -78,3 +78,44 @@ export function pushHistory(item) {
 export function clearHistory() {
   localStorage.removeItem(HISTORY_KEY);
 }
+
+// 十进制字符串 -> 最小单位整数（BigInt）；非法输入返回 null
+export function parseUnits(str, decimals) {
+  const s = String(str ?? '').trim();
+  if (!/^\d+(\.\d+)?$/.test(s) || s.length > 80) return null;
+  const d = Math.min(Math.max(Math.trunc(Number(decimals)) || 0, 0), 255);
+  const [i, f = ''] = s.split('.');
+  const frac = f.slice(0, d).padEnd(d, '0'); // 超出精度的部分截断
+  return BigInt(i) * 10n ** BigInt(d) + BigInt(frac || '0');
+}
+
+// 约等于 usd 美元的币数量（保留 2 位有效数字），无价格时返回 null
+export function amountForUsd(usd, price) {
+  if (!price || !(price > 0)) return null;
+  const v = usd / price;
+  // 保留 2 位有效数字并向上取整，保证阈值不低于 usd 美元
+  const exp = Math.floor(Math.log10(v)) - 1;
+  const step = 10 ** exp;
+  const up = Math.ceil(v / step - 1e-9) * step;
+  return exp >= 0 ? String(Math.round(up)) : up.toFixed(Math.min(-exp, 18)).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+const LAST_KEY = 'onledger.last';
+
+// 记住上次使用的链和币种（浏览器本地）
+export function loadLast() {
+  try {
+    const v = JSON.parse(localStorage.getItem(LAST_KEY));
+    return v && typeof v === 'object' ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveLast(v) {
+  try {
+    localStorage.setItem(LAST_KEY, JSON.stringify(v));
+  } catch {
+    /* 隐私模式等情况下忽略 */
+  }
+}

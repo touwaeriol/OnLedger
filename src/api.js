@@ -38,7 +38,7 @@ function downloadCsv(name, rows) {
   const esc = (v) => {
     let s = v == null ? '' : String(v);
     // 防止 CSV 公式注入（Excel 会执行以 = + - @ 开头的单元格）
-    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d/.test(s)) s = `'${s}`;
+    if (/^[=+\-@\t\r]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s = `'${s}`;
     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const blob = new Blob(['\uFEFF' + rows.map((r) => r.map(esc).join(',')).join('\r\n')], {
@@ -56,6 +56,7 @@ function downloadCsv(name, rows) {
 const webApi = {
   isDesktop: false,
   listChains: () => http('/api/chains'),
+  getPrices: () => http('/api/prices'),
   queryLedger: (req) => http('/api/ledger', { method: 'POST', body: req }),
   exportCsv: async (name, rows) => downloadCsv(name, rows),
   openExternal: async (url) => {

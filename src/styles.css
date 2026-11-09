@@ -52,3 +52,27 @@ body,
 .mono.ant-typography {
   font-size: 13px;
 }
+
+.app-subtitle {
+  font-size: 14px;
+  font-weight: normal;
+}
+
+.search-card .ant-card-body {
+  padding: 16px 20px 20px;
+}
+
+.filter-label {
+  width: 56px;
+  flex: none;
+}
+
+.stat-card {
+  height: 100%;
+}
+
+.stat-sub {
+  font-size: 12px;
+  display: block;
+  min-height: 18px;
+}
