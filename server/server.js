@@ -46,9 +46,10 @@ const SECRETS = [SETTINGS.etherscanApiKey, SETTINGS.tronApiKey].filter((s) => s.
 const MAX_URL_LENGTH = 2048;
 const MAX_BODY_BYTES = 4 * 1024;
 const BODY_TIMEOUT_MS = 10_000;
-const MAX_INFLIGHT_LEDGER = intEnv('MAX_INFLIGHT', 32, 1, 1024);
+// 并发上限：0 = 不限制（当前默认关闭，需要时通过环境变量开启）
+const MAX_INFLIGHT_LEDGER = intEnv('MAX_INFLIGHT', 0, 0, 1024);
 // 每个客户端（IPv4 / IPv6 /64）同时进行的查询数；同一 IPv6 /48 为其 3 倍
-const MAX_INFLIGHT_PER_CLIENT = intEnv('LEDGER_MAX_INFLIGHT_PER_IP', 3, 1, 1024);
+const MAX_INFLIGHT_PER_CLIENT = intEnv('LEDGER_MAX_INFLIGHT_PER_IP', 0, 0, 1024);
 const CACHE_TTL_MS = 30_000;
 const NEG_CACHE_TTL_MS = 60_000; // 上游明确拒绝（非临时性错误）的结果缓存时间，避免重复消耗 API 配额
 const CACHE_MAX_ENTRIES = 500;
@@ -305,6 +306,7 @@ const generalLimiter = new ClientLimiter({
 const clientInflight = new Map(); // 限流键 -> 进行中的数量
 
 function acquireClientSlot(ck) {
+  if (!MAX_INFLIGHT_PER_CLIENT) return () => {}; // 不限制
   const slots = [[ck.key, MAX_INFLIGHT_PER_CLIENT]];
   if (ck.wide) slots.push([ck.wide, MAX_INFLIGHT_PER_CLIENT * 3]);
   for (const [k, max] of slots) if ((clientInflight.get(k) || 0) >= max) return null;
@@ -443,7 +445,7 @@ async function getLedger(raw, client) {
 
   let job = inflight.get(key); // 相同查询正在进行，共享同一次上游调用
   if (!job) {
-    if (activeUpstream >= MAX_INFLIGHT_LEDGER) {
+    if (MAX_INFLIGHT_LEDGER && activeUpstream >= MAX_INFLIGHT_LEDGER) {
       throw new HttpError(503, '服务繁忙，请稍后再试', { 'Retry-After': '5' });
     }
     job = startJob(key, raw);

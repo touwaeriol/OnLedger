@@ -27,7 +27,7 @@ const doFetch = (url, opts) =>
 
 // ---- 按上游域名限速 + 并发上限 + 每日额度：保护 API Key 配额，避免被上游封禁 ----
 const HOST_INTERVAL_MS = envInt('UPSTREAM_MIN_INTERVAL_MS', 220, 0, 60000); // 约 4.5 次/秒
-const HOST_MAX_CONCURRENCY = envInt('UPSTREAM_MAX_CONCURRENCY', 4, 1, 256); // 每个域名同时进行的请求数
+const HOST_MAX_CONCURRENCY = envInt('UPSTREAM_MAX_CONCURRENCY', 0, 0, 256) || Infinity; // 每个域名同时进行的请求数，0 = 不限制（默认）
 const HOST_MAX_QUEUE = envInt('UPSTREAM_MAX_QUEUE', 60, 0, 10000); // 每个域名排队等待的请求数
 // 每日调用额度（UTC 0 点重置，仅内存计数；0 表示不限）
 const DAILY_BUDGET = {
