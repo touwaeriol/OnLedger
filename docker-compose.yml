@@ -1,0 +1,36 @@
+services:
+  onledger:
+    build: .
+    image: onledger:latest
+    container_name: onledger
+    restart: unless-stopped
+    # 只发布到本机回环地址，由宿主机上的 Caddy 反向代理（TLS / 压缩）
+    ports:
+      - "127.0.0.1:${ONLEDGER_PORT:-8096}:8080"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      TRUST_PROXY: "1"
+      NODE_ENV: production
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    pids_limit: 100
+    cpus: 1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

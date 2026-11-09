@@ -1,0 +1,54 @@
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+.app-layout {
+  min-height: 100%;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  height: 56px;
+  line-height: 56px;
+}
+
+.app-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.app-content {
+  padding: 16px 24px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.amount-in {
+  color: #389e0d;
+}
+
+.amount-out {
+  color: #cf1322;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.mono.ant-typography {
+  font-size: 13px;
+}
