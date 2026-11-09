@@ -27,6 +27,10 @@ const doFetch = (url, opts) =>
 
 // ---- 按上游域名限速 + 并发上限 + 每日额度：保护 API Key 配额，避免被上游封禁 ----
 const HOST_INTERVAL_MS = envInt('UPSTREAM_MIN_INTERVAL_MS', 220, 0, 60000); // 约 4.5 次/秒
+// 个别域名的请求间隔：TronGrid 无 Key 时实测约 1 次/秒，更快会被 429
+const HOST_INTERVALS = {
+  'api.trongrid.io': envInt('TRONGRID_MIN_INTERVAL_MS', 1100, 0, 60000),
+};
 const HOST_MAX_CONCURRENCY = envInt('UPSTREAM_MAX_CONCURRENCY', 0, 0, 256) || Infinity; // 每个域名同时进行的请求数，0 = 不限制（默认）
 const HOST_MAX_QUEUE = envInt('UPSTREAM_MAX_QUEUE', 60, 0, 10000); // 每个域名排队等待的请求数
 // 每日调用额度（UTC 0 点重置，仅内存计数；0 表示不限）
@@ -107,7 +111,7 @@ function sleep(ms, signal) {
 }
 
 // 取得某域名的一个并发名额并满足最小间隔，同时扣减每日额度；返回释放函数
-async function acquire(host, signal) {
+async function acquire(host, signal, intervalOverride) {
   if (signal.aborted) throw abortError();
   const st = getHostState(host);
   if (budgetLeft(st, host) <= 0) throw new QuotaError();
@@ -141,7 +145,9 @@ async function acquire(host, signal) {
   try {
     const now = Date.now();
     const at = Math.max(now, st.next);
-    st.next = at + (st.slowUntil > now ? HOST_INTERVAL_MS * 2 : HOST_INTERVAL_MS);
+    const base = intervalOverride ?? HOST_INTERVALS[host] ?? HOST_INTERVAL_MS;
+    st.interval = base;
+    st.next = at + (st.slowUntil > now ? base * 2 : base);
     if (at > now) await sleep(at - now, signal);
     if (budgetLeft(st, host) <= 0) throw new QuotaError();
     st.used++;
@@ -208,7 +214,7 @@ function retryDelay(res, attempt) {
  * 超时从排队开始计算（包括重试等待），首次排队期间超时视为繁忙（BusyError）。
  * 上游 429/503 时自动重试，每次重试同样经过限速、并发与每日额度控制。
  */
-async function getJSON(url, { method, body, headers = {}, timeout = DEFAULT_TIMEOUT, signal } = {}) {
+async function getJSON(url, { method, body, headers = {}, timeout = DEFAULT_TIMEOUT, signal, minInterval, retries = MAX_RETRIES } = {}) {
   const host = new URL(url).host;
   const m = String(method || (body !== undefined ? 'POST' : 'GET')).toUpperCase();
   if (m !== 'GET' && m !== 'POST') throw new Error(`不支持的请求方法: ${m}`);
@@ -236,7 +242,7 @@ async function getJSON(url, { method, body, headers = {}, timeout = DEFAULT_TIME
   try {
     for (;;) {
       phase = 'queue';
-      release = await acquire(host, controller.signal);
+      release = await acquire(host, controller.signal, minInterval);
       phase = 'fetch';
       const res = await doFetch(url, { ...init, signal: controller.signal });
       const text = await readText(res, () => controller.abort());
@@ -252,9 +258,9 @@ async function getJSON(url, { method, body, headers = {}, timeout = DEFAULT_TIME
         if (res.status === 429) {
           // 暂时放慢该域名：之后 30 秒内请求间隔加倍，并推迟下一个请求
           st.slowUntil = Date.now() + SLOWDOWN_MS;
-          st.next = Math.max(st.next, Date.now() + HOST_INTERVAL_MS * 2);
+          st.next = Math.max(st.next, Date.now() + (st.interval || HOST_INTERVAL_MS) * 2);
         }
-        if (attempt >= MAX_RETRIES) {
+        if (attempt >= retries) {
           throw upstreamError(`数据源繁忙（${host}），请稍等几秒后重试`, { transient: true, status: res.status });
         }
         const delay = retryDelay(res, attempt);
@@ -291,6 +297,51 @@ async function getJSON(url, { method, body, headers = {}, timeout = DEFAULT_TIME
     if (ext) ext.removeEventListener('abort', onExtAbort);
     if (release) release();
   }
+}
+
+// ---- 多端点轮询：多个兼容的公开节点之间分摊请求，失败自动切换 ----
+const poolCursor = new Map(); // 端点组 -> 轮询计数
+
+/**
+ * 依次尝试多个兼容端点（bases 为基础 URL 数组，path 拼在后面）。
+ * 顺序：优先最早可用（未在限速等待 / 未被 429 降速）的端点，同等条件下轮询；
+ * 遇到临时错误（429、5xx、超时、网络错误、本地排队繁忙）换下一个端点，全部失败时抛出最后一个错误。
+ */
+async function getJSONAny(bases, path, opts = {}) {
+  const key = bases.join('|');
+  const n = (poolCursor.get(key) || 0) + 1;
+  poolCursor.set(key, n % 1e9);
+  const now = Date.now();
+  const ranked = bases
+    .map((b, i) => {
+      const st = hostState.get(new URL(b).host);
+      const ready = st ? Math.max(st.next || 0, now) + (st.slowUntil > now ? 5000 : 0) : now;
+      return { b, ready, rr: (i - n + bases.length * 1e3) % bases.length };
+    })
+    .sort((x, y) => x.ready - y.ready || x.rr - y.rr);
+  let lastErr;
+  for (let i = 0; i < ranked.length; i++) {
+    const { b } = ranked[i];
+    const last = i === ranked.length - 1;
+    try {
+      // 还有备用端点时不在同一端点上重试，直接切换；最后一个端点保留正常重试
+      return await getJSON(b + path, last ? opts : { ...opts, retries: 0 });
+    } catch (e) {
+      if (e && e.transient && !e.aborted) {
+        // 出错的端点冷却 30 秒：排序时排到后面
+        const st = hostState.get(new URL(b).host);
+        if (st) st.slowUntil = Math.max(st.slowUntil || 0, Date.now() + SLOWDOWN_MS);
+      }
+      if (e instanceof QuotaError) {
+        lastErr = e;
+        continue;
+      }
+      const retryable = e instanceof BusyError || (e && e.transient && !e.aborted);
+      if (!retryable) throw e;
+      lastErr = e;
+    }
+  }
+  throw lastErr;
 }
 
 // 整数字符串 + 精度 -> 十进制字符串（BigInt，避免浮点误差）
@@ -355,4 +406,4 @@ const __testing = {
   },
 };
 
-module.exports = { getJSON, formatUnits, tronHexToBase58, BusyError, QuotaError, runWithSignal, __testing };
+module.exports = { getJSON, getJSONAny, formatUnits, tronHexToBase58, BusyError, QuotaError, runWithSignal, __testing };

@@ -1,7 +1,8 @@
-// Bitcoin：mempool.space (Esplora) API https://mempool.space/docs/api/rest
-const { getJSON, formatUnits } = require('./util');
+// Bitcoin：Esplora API（mempool.space / blockstream.info / mempool.emzy.de 接口兼容，轮询 + 失败切换）
+// https://mempool.space/docs/api/rest
+const { getJSONAny, formatUnits } = require('./util');
 
-const API = 'https://mempool.space/api';
+const APIS = ['https://mempool.space/api', 'https://blockstream.info/api', 'https://mempool.emzy.de/api'];
 const CONFIRMED_PAGE = 25; // Esplora 每页 25 条已确认交易
 
 function toRecord(tx, address, token) {
@@ -55,15 +56,16 @@ function toRecord(tx, address, token) {
 
 async function query({ token, address, cursor }) {
   // 首页：最多 50 条未确认 + 25 条已确认；之后用最后一个已确认 txid 翻页
-  const url = cursor ? `${API}/address/${address}/txs/chain/${cursor}` : `${API}/address/${address}/txs`;
-  const list = await getJSON(url);
+  const path = cursor ? `/address/${address}/txs/chain/${cursor}` : `/address/${address}/txs`;
+  const list = await getJSONAny(APIS, path);
+  if (!Array.isArray(list)) throw new Error('上游接口返回格式错误');
   const confirmed = list.filter((tx) => tx.status?.confirmed);
   const nextCursor = confirmed.length >= CONFIRMED_PAGE ? confirmed[confirmed.length - 1].txid : null;
   return { records: list.map((tx) => toRecord(tx, address, token)), nextCursor };
 }
 
 async function balance({ token, address }) {
-  const d = await getJSON(`${API}/address/${address}`);
+  const d = await getJSONAny(APIS, `/address/${address}`);
   const c = d.chain_stats;
   const m = d.mempool_stats;
   const sats =
